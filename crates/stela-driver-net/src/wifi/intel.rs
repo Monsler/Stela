@@ -11,6 +11,7 @@ pub mod association;
 pub mod attach;
 pub mod boot;
 pub mod calibration;
+pub mod cold;
 pub mod command;
 pub mod context;
 pub mod context_v2;

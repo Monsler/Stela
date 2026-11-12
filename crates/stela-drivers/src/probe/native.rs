@@ -658,22 +658,55 @@ pub(super) unsafe fn intel_wifi<B: wifi::intel::radio::bios::service::BiosIo>(
     let minimum = services
         .minimum_delay()
         .map_err(|error| (Error::Native(error), None))?;
-    use wifi::intel::attach::{AttachError, Pci, attach};
-    let Claimed {
-        mut function,
-        domain,
-        bars,
-    } = claim(services, address)?;
+    use wifi::intel::{
+        attach::{AttachError, Pci, attach},
+        cold,
+    };
+    let mut requester = services
+        .prepare_requester(address)
+        .map_err(|error| (Error::Native(error), None))?;
+    // Restore D0 and size BAR0 with the original DMA root and BME seal held.
+    if let Err(error) = requester.function_mut().power_up(minimum.as_ref()) {
+        return Err(keep_error(
+            Error::IntelWifi(AttachError::Cold(cold::Error::Pci(error))),
+            requester,
+        ));
+    }
+    let bars = match requester.function_mut().bars() {
+        Ok(bars) => bars,
+        Err(error) => return Err(keep_error(error, requester)),
+    };
     let registers = match map(services, address, &bars, 0) {
         Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
+        Err(error) => return Err(keep_error(Error::Native(error), requester)),
     };
+    // SAFETY: paired original D0 requester/root/BAR, prior firmware/IRQ/work
+    // and conflicting reset owners excluded by the cold mount. No new DMA yet.
+    let cold::Bound {
+        mut function,
+        attachment,
+        registers,
+        minimum,
+    } = unsafe {
+        cold::reset_and_bind(cold::Inputs {
+            requester,
+            registers,
+            minimum,
+        })
+    }
+    .map_err(|failure| {
+        (
+            Error::IntelWifi(AttachError::Cold(failure.error.clone())),
+            Some(Box::new(failure) as Box<dyn Any>),
+        )
+    })?;
+    let domain = attachment.domain();
     let window = match registers.address(0, 16384) {
         Ok(window) => window,
         Err(error) => {
             return Err(keep_error(
                 Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
+                (function, attachment, registers),
             ));
         }
     };
@@ -720,19 +753,21 @@ pub(super) unsafe fn intel_wifi<B: wifi::intel::radio::bios::service::BiosIo>(
     })();
     let (pci, vector) = match configured {
         Ok(configured) => configured,
-        Err(error) => return Err(keep_error(error, (function, domain, registers))),
+        Err(error) => return Err(keep_error(error, (function, attachment, registers))),
     };
     let owner: Rc<dyn wifi::intel::boot::FunctionOwner> = Rc::new(IntelOwner {
         function: RefCell::new(function),
         _registers: registers,
+        _attachment: attachment,
         vector,
         minimum: minimum.clone(),
     });
     let kept = |owner: &Rc<dyn wifi::intel::boot::FunctionOwner>| {
         Some(Box::new(owner.clone()) as Box<dyn Any>)
     };
-    // SAFETY: the mount claimed the stopped function and mapped its BAR0
-    // uncached; `owner` keeps both, and its interrupts are off.
+    // SAFETY: completed FLR and original-root drain preceded domain binding;
+    // `owner` keeps the original function, BAR0 and attachment. PCI routes are
+    // configured above, while device interrupt masks remain reset/off.
     let io = unsafe {
         wifi::intel::boot::NativeBootIo::from_window(window.cast(), owner.clone(), minimum.clone())
     }
@@ -774,6 +809,7 @@ impl IntelVector {
 struct IntelOwner {
     function: RefCell<Function<OwnedConfig>>,
     _registers: Mapping,
+    _attachment: crate::bus::pci::requester::preparation::Attachment,
     vector: Option<IntelVector>,
     minimum: Rc<dyn crate::bus::pci::power::Timer>,
 }

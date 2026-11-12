@@ -45,6 +45,7 @@ pub struct Pci {
 /// Why the function did not reach ROM boot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttachError {
+    Cold(super::cold::Error),
     /// The handoff carries no regulatory database, so nothing may scan.
     NoRegulatoryDatabase,
     /// This build reads no ACPI namespace, which iwlwifi's platform
